@@ -49,6 +49,7 @@ from smolagents.agents import (
     populate_template,
 )
 from smolagents.default_tools import DuckDuckGoSearchTool, FinalAnswerTool, PythonInterpreterTool, VisitWebpageTool
+from smolagents.local_python_executor import PythonExecutor
 from smolagents.memory import (
     ActionStep,
     CallbackRegistry,
@@ -2568,6 +2569,241 @@ final_answer("Final report.")
         with manager_toolcalling_agent.logger.console.capture() as capture:
             manager_toolcalling_agent.visualize()
         assert "├──" in capture.get()
+
+
+class ScriptedModel(Model):
+    """Model that returns the given code actions one after the other, and raises the exceptions found among them."""
+
+    def __init__(self, actions):
+        super().__init__()
+        self.actions = list(actions)
+        self.call_count = 0
+
+    def generate(self, messages, stop_sequences=None, **kwargs):
+        action = self.actions[self.call_count]
+        self.call_count += 1
+        if isinstance(action, BaseException):
+            raise action
+        return ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=f"Thought: next step.\n<code>\n{action}\n</code>",
+            token_usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+
+class TestCheckpoint:
+    STEPS = [
+        "import math\ncount = 5\ndef double(value):\n    return value * 2",
+        "total = double(count) + math.floor(2.5)\nprint(total)",
+        "final_answer(count + total)",
+    ]
+
+    def test_code_agent_resumes_after_last_completed_step(self, tmp_path):
+        checkpoint_path = tmp_path / "checkpoints" / "run.json"
+        agent = CodeAgent(tools=[], model=ScriptedModel([*self.STEPS[:2], RuntimeError("Connection lost")]))
+        with pytest.raises(AgentGenerationError):
+            agent.run("Compute the total.", checkpoint_path=checkpoint_path)
+        assert not checkpoint_path.with_name("run.json.tmp").exists()
+
+        # Only the last step is left to do: it needs the variables, imports and functions of the previous steps
+        model = ScriptedModel(self.STEPS[2:])
+        new_agent = CodeAgent(tools=[], model=model)
+        result = new_agent.resume(checkpoint_path, return_full_result=True)
+
+        assert result.output == 17
+        assert model.call_count == 1
+        action_steps = [step for step in new_agent.memory.steps if isinstance(step, ActionStep)]
+        assert [step.step_number for step in action_steps] == [1, 2, 3]
+        assert [type(step) for step in new_agent.memory.steps] == [TaskStep, ActionStep, ActionStep, ActionStep]
+        assert "12" in action_steps[1].observations
+        assert result.token_usage == TokenUsage(input_tokens=30, output_tokens=15)
+        assert new_agent.monitor.get_total_token_counts() == TokenUsage(input_tokens=30, output_tokens=15)
+
+    def test_interrupted_step_is_run_again(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        # The second step fails in the middle of the execution of its code, after `count` was changed
+        agent = CodeAgent(tools=[], model=ScriptedModel(["count = 1", "count = 2\nraise_keyboard_interrupt()"]))
+
+        def raise_keyboard_interrupt():
+            raise KeyboardInterrupt
+
+        agent.python_executor.additional_functions["raise_keyboard_interrupt"] = raise_keyboard_interrupt
+        with pytest.raises(KeyboardInterrupt):
+            agent.run("Count.", checkpoint_path=checkpoint_path)
+        assert agent.python_executor.state["count"] == 2
+
+        new_agent = CodeAgent(tools=[], model=ScriptedModel(["final_answer(count)"]))
+        assert new_agent.resume(checkpoint_path) == 1
+        assert [step.step_number for step in new_agent.memory.steps if isinstance(step, ActionStep)] == [1, 2]
+
+    def test_resume_respects_max_steps_and_planning(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+
+        class PlanningScriptedModel(ScriptedModel):
+            def generate(self, messages, stop_sequences=None, **kwargs):
+                if stop_sequences == ["<end_plan>"]:
+                    return ChatMessage(role=MessageRole.ASSISTANT, content="The plan.")
+                return super().generate(messages, stop_sequences=stop_sequences, **kwargs)
+
+        agent = CodeAgent(
+            tools=[], model=PlanningScriptedModel(["x = 1", RuntimeError("Connection lost")]), planning_interval=1
+        )
+        with pytest.raises(AgentGenerationError):
+            agent.run("Count.", checkpoint_path=checkpoint_path)
+        # The second step was interrupted after its planning
+        assert [type(step) for step in agent.memory.steps[:4]] == [TaskStep, PlanningStep, ActionStep, PlanningStep]
+
+        new_agent = CodeAgent(tools=[], model=PlanningScriptedModel(["x = 2", "x = 3"]), planning_interval=1)
+        result = new_agent.resume(checkpoint_path, max_steps=2, return_full_result=True)
+
+        assert result.state == "max_steps_error"
+        assert [type(step) for step in new_agent.memory.steps] == [
+            TaskStep,
+            PlanningStep,
+            ActionStep,
+            PlanningStep,
+            ActionStep,
+            ActionStep,  # Final answer after reaching max steps
+        ]
+        assert new_agent.python_executor.state["x"] == 2
+
+    def test_resume_finished_run_returns_final_answer(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        agent = CodeAgent(tools=[], model=ScriptedModel(self.STEPS))
+        assert agent.run("Compute the total.", checkpoint_path=checkpoint_path) == 17
+
+        model = ScriptedModel([])
+        assert CodeAgent(tools=[], model=model).resume(checkpoint_path) == 17
+        assert model.call_count == 0
+
+    def test_run_without_checkpoint_path_stops_checkpointing(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        agent = CodeAgent(tools=[], model=ScriptedModel(["final_answer(1)", "final_answer(2)"]))
+        agent.run("First task.", checkpoint_path=checkpoint_path)
+        content = checkpoint_path.read_text()
+        agent.run("Second task.")
+        assert checkpoint_path.read_text() == content
+
+    def test_tool_calling_agent_resumes(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+
+        class FailingModel(FakeToolCallModel):
+            def generate(self, messages, tools_to_call_from=None, stop_sequences=None):
+                if len(messages) >= 3:
+                    raise RuntimeError("Connection lost")
+                return super().generate(messages, tools_to_call_from, stop_sequences)
+
+        agent = ToolCallingAgent(tools=[PythonInterpreterTool()], model=FailingModel())
+        with pytest.raises(AgentGenerationError):
+            agent.run("What is 2 multiplied by 3.6452?", checkpoint_path=checkpoint_path)
+
+        new_agent = ToolCallingAgent(tools=[PythonInterpreterTool()], model=FakeToolCallModel())
+        assert new_agent.resume(checkpoint_path) == "7.2904"
+        action_steps = [step for step in new_agent.memory.steps if isinstance(step, ActionStep)]
+        assert [step.step_number for step in action_steps] == [1, 2]
+        assert action_steps[0].tool_calls[0].name == "python_interpreter"
+
+    def test_load_checkpoint_checks_agent_structure(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        CodeAgent(tools=[], model=ScriptedModel([])).save_checkpoint(checkpoint_path)
+
+        with pytest.raises(ValueError, match="does not contain any run to resume"):
+            CodeAgent(tools=[], model=ScriptedModel([])).resume(checkpoint_path)
+        with pytest.raises(ValueError, match="cannot be loaded in a 'ToolCallingAgent'"):
+            ToolCallingAgent(tools=[], model=ScriptedModel([])).load_checkpoint(checkpoint_path)
+        managed_agent = CodeAgent(tools=[], model=ScriptedModel([]), name="helper", description="Helps.")
+        with pytest.raises(ValueError, match="managed agents"):
+            CodeAgent(tools=[], model=ScriptedModel([]), managed_agents=[managed_agent]).load_checkpoint(
+                checkpoint_path
+            )
+
+    def test_remote_executor_is_not_supported(self, tmp_path):
+        agent = CodeAgent(tools=[], model=ScriptedModel(["final_answer(1)"]), executor=MagicMock(spec=PythonExecutor))
+        agent.python_executor.dump_state.side_effect = PythonExecutor.dump_state.__get__(agent.python_executor)
+        with pytest.raises(NotImplementedError, match="does not support dumping its state"):
+            agent.run("Task.", checkpoint_path=tmp_path / "run.json")
+
+    @staticmethod
+    def create_manager(manager_actions, helper_actions):
+        helper = CodeAgent(
+            tools=[], model=ScriptedModel(helper_actions), name="helper", description="Does the computations."
+        )
+        manager = CodeAgent(tools=[], model=ScriptedModel(manager_actions), managed_agents=[helper])
+        return manager, helper
+
+    MANAGER_STEPS = [
+        "prefix = 'Report: '",
+        "report = helper(task='Compute the data.')",
+        "final_answer(prefix + report)",
+    ]
+    HELPER_STEPS = ["data = 21", "data = data * 2", "final_answer(data)"]
+
+    def test_managed_agent_resumes_after_its_last_completed_step(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        manager, helper = self.create_manager(self.MANAGER_STEPS, [*self.HELPER_STEPS[:2], KeyboardInterrupt()])
+        with pytest.raises(KeyboardInterrupt):
+            manager.run("Write the report.", checkpoint_path=checkpoint_path)
+
+        # The manager runs its interrupted second step again, and the helper only has its last step left to do
+        new_manager, new_helper = self.create_manager(self.MANAGER_STEPS[1:], self.HELPER_STEPS[2:])
+        result = new_manager.resume(checkpoint_path)
+
+        assert result.startswith("Report: ") and "42" in result
+        assert new_manager.model.call_count == 2
+        assert new_helper.model.call_count == 1
+        assert [step.step_number for step in new_helper.memory.steps if isinstance(step, ActionStep)] == [1, 2, 3]
+        assert [step.step_number for step in new_manager.memory.steps if isinstance(step, ActionStep)] == [1, 2, 3]
+
+    def test_managed_agent_restarts_when_given_another_task(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        manager, helper = self.create_manager(self.MANAGER_STEPS, [*self.HELPER_STEPS[:2], KeyboardInterrupt()])
+        with pytest.raises(KeyboardInterrupt):
+            manager.run("Write the report.", checkpoint_path=checkpoint_path)
+
+        new_manager, new_helper = self.create_manager(
+            ["report = helper(task='Compute something else.')", "final_answer(prefix + report)"],
+            ["final_answer(data)"],
+        )
+        result = new_manager.resume(checkpoint_path)
+
+        # The helper starts over, but still has the variables of its executor
+        assert "42" in result
+        assert [type(step) for step in new_helper.memory.steps] == [TaskStep, ActionStep]
+
+    def test_managed_agent_run_is_not_resumed_once_manager_step_is_completed(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        # The manager is interrupted in its third step, after the step that called the helper was completed
+        manager, helper = self.create_manager(
+            [*self.MANAGER_STEPS[:2], RuntimeError("Connection lost")], self.HELPER_STEPS
+        )
+        with pytest.raises(AgentGenerationError):
+            manager.run("Write the report.", checkpoint_path=checkpoint_path)
+        checkpoint = json.loads(checkpoint_path.read_text())
+        assert checkpoint["resumable"] is True
+        assert checkpoint["managed_agents"]["helper"]["resumable"] is False
+
+        # Calling the helper again with the same task is a new run for it
+        new_manager, new_helper = self.create_manager(
+            ["report = helper(task='Compute the data.')", "final_answer(prefix + report)"], ["final_answer(data + 1)"]
+        )
+        assert "43" in new_manager.resume(checkpoint_path)
+        assert new_helper.model.call_count == 1
+
+    def test_checkpoint_keeps_manager_state_of_its_last_completed_step(self, tmp_path):
+        checkpoint_path = tmp_path / "run.json"
+        manager, helper = self.create_manager(
+            ["prefix = 'Report: '", "prefix = 'Changed: '\nreport = helper(task='Compute the data.')"],
+            [self.HELPER_STEPS[0], KeyboardInterrupt()],
+        )
+        with pytest.raises(KeyboardInterrupt):
+            manager.run("Write the report.", checkpoint_path=checkpoint_path)
+        assert manager.python_executor.state["prefix"] == "Changed: "
+
+        new_manager, new_helper = self.create_manager([], [])
+        new_manager.load_checkpoint(checkpoint_path)
+        assert new_manager.python_executor.state["prefix"] == "Report: "
+        assert new_helper.python_executor.state["data"] == 21
+        assert len([step for step in new_manager.memory.steps if isinstance(step, ActionStep)]) == 1
 
 
 @pytest.fixture

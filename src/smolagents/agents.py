@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 import textwrap
+import threading
 import time
 import warnings
 from abc import ABC, abstractmethod
@@ -78,6 +79,7 @@ from .monitoring import (
     TokenUsage,
 )
 from .remote_executors import BlaxelExecutor, DockerExecutor, E2BExecutor, ModalExecutor
+from .serialization import SafeSerializer
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -253,6 +255,10 @@ class RunResult:
         }
 
 
+# Version of the checkpoint file format, to be incremented on breaking changes
+CHECKPOINT_VERSION = 1
+
+
 StreamEvent: TypeAlias = Union[
     ChatMessageStreamDelta,
     ChatMessageToolCall,
@@ -351,6 +357,18 @@ class MultiStepAgent(ABC):
         self._setup_step_callbacks(step_callbacks)
         self.stream_outputs = False
 
+        # Checkpointing: each agent keeps its own state as of its last completed step,
+        # and the agent at the top of the hierarchy writes them all to the checkpoint file.
+        self._checkpoint: dict[str, Any] | None = None
+        self._checkpoint_path: Path | None = None
+        self._checkpoint_root: MultiStepAgent | None = None
+        self._checkpoint_lock = threading.Lock()
+        # Whether the last run was not yet accounted for in a completed step of a manager agent
+        self._has_resumable_run = False
+        # Whether a run restored from a checkpoint is waiting to be resumed
+        self._resume_pending = False
+        self._unsaved_state_keys: set[str] = set()
+
     @property
     def system_prompt(self) -> str:
         return self.initialize_system_prompt()
@@ -442,6 +460,7 @@ class MultiStepAgent(ABC):
         additional_args: dict | None = None,
         max_steps: int | None = None,
         return_full_result: bool | None = None,
+        checkpoint_path: str | Path | None = None,
     ) -> Any | RunResult:
         """
         Run the agent for the given task.
@@ -457,6 +476,8 @@ class MultiStepAgent(ABC):
             max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task. if not provided, will use the agent's default value.
             return_full_result (`bool`, *optional*): Whether to return the full [`RunResult`] object or just the final answer output.
                 If `None` (default), the agent's `self.return_full_result` setting is used.
+            checkpoint_path (`str` or `Path`, *optional*): File in which to save the state of the agent, and of its managed agents,
+                after each completed step. An interrupted run can then be continued with [`~MultiStepAgent.resume`].
 
         Example:
         ```py
@@ -466,6 +487,7 @@ class MultiStepAgent(ABC):
         ```
         """
         max_steps = max_steps or self.max_steps
+        previous_task = self.task
         self.task = task
         self.interrupt_switch = False
         if additional_args:
@@ -474,8 +496,15 @@ class MultiStepAgent(ABC):
 You have been provided with these additional arguments, that you can access directly using the keys as variables:
 {str(additional_args)}."""
 
+        # A run restored from a checkpoint is continued when the agent is given the same task again
+        resume = self._resume_pending and self.task == previous_task
+        self._resume_pending = False
+        self._has_resumable_run = True
+
         self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
-        if reset:
+        if resume:
+            images = next(step.task_images for step in reversed(self.memory.steps) if isinstance(step, TaskStep))
+        elif reset:
             self.memory.reset()
             self.monitor.reset()
 
@@ -485,18 +514,26 @@ You have been provided with these additional arguments, that you can access dire
             level=LogLevel.INFO,
             title=self.name if hasattr(self, "name") else None,
         )
-        self.memory.steps.append(TaskStep(task=self.task, task_images=images))
+        if not resume:
+            self.memory.steps.append(TaskStep(task=self.task, task_images=images))
 
         if getattr(self, "python_executor", None):
-            self.python_executor.send_variables(variables=self.state)
+            if not resume:  # When resuming, the variables of the executor were restored from the checkpoint
+                self.python_executor.send_variables(variables=self.state)
             self.python_executor.send_tools({**self.tools, **self.managed_agents})
+
+        if checkpoint_path is not None:
+            self._setup_checkpointing(checkpoint_path)
+        elif self._checkpoint_root is self:
+            self._teardown_checkpointing()
+        self._save_step_checkpoint(seal_managed_agents=not resume)
 
         if stream:
             # The steps are returned as they are executed through a generator to iterate on.
-            return self._run_stream(task=self.task, max_steps=max_steps, images=images)
+            return self._run_stream(task=self.task, max_steps=max_steps, images=images, resume=resume)
 
         run_start_time = time.time()
-        steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images))
+        steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images, resume=resume))
 
         # Outputs are returned only at the end. We only look at the last step.
         assert isinstance(steps[-1], FinalAnswerStep)
@@ -538,17 +575,33 @@ You have been provided with these additional arguments, that you can access dire
         return output
 
     def _run_stream(
-        self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None
+        self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None, resume: bool = False
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta]:
         self.step_number = 1
         returned_final_answer = False
+        if resume:
+            # Pick up after the last action step that was completed for the current task
+            for memory_step in reversed(self.memory.steps):
+                if isinstance(memory_step, TaskStep):
+                    break
+                if isinstance(memory_step, ActionStep):
+                    action_step = memory_step
+                    self.step_number = action_step.step_number + 1
+                    if action_step.is_final_answer or isinstance(action_step.error, AgentMaxStepsError):
+                        # The run was already finished
+                        final_answer = action_step.action_output
+                        returned_final_answer = True
+                    break
         while not returned_final_answer and self.step_number <= max_steps:
             if self.interrupt_switch:
                 raise AgentError("Agent interrupted.", self.logger)
 
             # Run a planning step if scheduled
-            if self.planning_interval is not None and (
-                self.step_number == 1 or (self.step_number - 1) % self.planning_interval == 0
+            if (
+                self.planning_interval is not None
+                and (self.step_number == 1 or (self.step_number - 1) % self.planning_interval == 0)
+                # When resuming from a checkpoint, the planning step may already have been done
+                and not isinstance(self.memory.steps[-1], PlanningStep)
             ):
                 planning_start_time = time.time()
                 planning_step = None
@@ -565,6 +618,7 @@ You have been provided with these additional arguments, that you can access dire
                 )
                 self._finalize_step(planning_step)
                 self.memory.steps.append(planning_step)
+                self._save_step_checkpoint(seal_managed_agents=False)
 
             # Start action step!
             action_step_start_time = time.time()
@@ -574,6 +628,7 @@ You have been provided with these additional arguments, that you can access dire
                 observations_images=images,
             )
             self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
+            step_completed = False
             try:
                 for output in self._step_stream(action_step):
                     # Yield all
@@ -590,6 +645,7 @@ You have been provided with these additional arguments, that you can access dire
                             self._validate_final_answer(final_answer)
                         returned_final_answer = True
                         action_step.is_final_answer = True
+                step_completed = True
 
             except AgentGenerationError as e:
                 # Agent generation errors are not caused by a Model error but an implementation error: so we should raise them and exit.
@@ -597,13 +653,16 @@ You have been provided with these additional arguments, that you can access dire
             except AgentError as e:
                 # Other AgentError types are caused by the Model, so we should log them and iterate.
                 action_step.error = e
+                step_completed = True
             finally:
                 self._finalize_step(action_step)
                 self.memory.steps.append(action_step)
+                if step_completed:  # An interrupted step is not checkpointed: it will be run again when resuming
+                    self._save_step_checkpoint()
                 yield action_step
                 self.step_number += 1
 
-        if not returned_final_answer and self.step_number == max_steps + 1:
+        if not returned_final_answer and self.step_number > max_steps:
             final_answer = self._handle_max_steps_reached(task)
             yield action_step
         final_answer_step = FinalAnswerStep(handle_agent_output_types(final_answer))
@@ -634,6 +693,7 @@ You have been provided with these additional arguments, that you can access dire
         final_memory_step.action_output = final_answer.content
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
+        self._save_step_checkpoint()
         return final_answer.content
 
     def _generate_planning_step(
@@ -888,6 +948,199 @@ You have been provided with these additional arguments, that you can access dire
                 answer += "\n" + truncate_content(str(content)) + "\n---"
             answer += "\n</summary_of_work>"
         return answer
+
+    def resume(
+        self,
+        checkpoint_path: str | Path,
+        stream: bool = False,
+        max_steps: int | None = None,
+        return_full_result: bool | None = None,
+    ) -> Any | RunResult:
+        """
+        Resume a run from a checkpoint file written by `agent.run(task, checkpoint_path=...)`.
+
+        The agent, which should be configured like the one that was interrupted, gets back its memory and state (for a
+        [`CodeAgent`], the variables of its Python executor), and so do its managed agents. The run then continues after
+        the last completed step, and keeps on being saved to the same checkpoint file.
+        A managed agent that was interrupted in the middle of its own run also picks up from its last completed step,
+        provided that its manager agent calls it again with the same task.
+
+        Args:
+            checkpoint_path (`str` or `Path`): Checkpoint file to resume from.
+            stream (`bool`): Whether to run in streaming mode.
+            max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task, including those
+                taken before the interruption. If not provided, will use the agent's default value.
+            return_full_result (`bool`, *optional*): Whether to return the full [`RunResult`] object or just the final answer output.
+                If `None` (default), the agent's `self.return_full_result` setting is used.
+
+        Example:
+        ```py
+        from smolagents import CodeAgent
+        agent = CodeAgent(tools=[], model=model)
+        agent.run("What is the result of 2 power 3.7384?", checkpoint_path="checkpoint.json")
+        # If the run above gets interrupted, create the same agent again and continue the run:
+        agent = CodeAgent(tools=[], model=model)
+        agent.resume("checkpoint.json")
+        ```
+        """
+        self.load_checkpoint(checkpoint_path)
+        if not self._resume_pending:
+            raise ValueError(f"Checkpoint '{checkpoint_path}' does not contain any run to resume.")
+        return self.run(
+            self.task,
+            stream=stream,
+            max_steps=max_steps,
+            return_full_result=return_full_result,
+            checkpoint_path=checkpoint_path,
+        )
+
+    def save_checkpoint(self, checkpoint_path: str | Path) -> None:
+        """
+        Save the current state of the agent and of its managed agents to a checkpoint file.
+
+        This is done automatically after each step when passing `checkpoint_path` to [`~MultiStepAgent.run`].
+        Call it between steps or runs only: a step in progress cannot be saved.
+
+        Args:
+            checkpoint_path (`str` or `Path`): File in which to save the checkpoint.
+        """
+        for agent in self._get_agent_hierarchy():
+            agent._checkpoint = agent._get_checkpoint_state()
+        self._write_checkpoint(checkpoint_path)
+
+    def load_checkpoint(self, checkpoint_path: str | Path) -> None:
+        """
+        Restore the state of the agent and of its managed agents from a checkpoint file.
+
+        Use [`~MultiStepAgent.resume`] to also continue the run that was saved.
+
+        Args:
+            checkpoint_path (`str` or `Path`): Checkpoint file to load.
+        """
+        checkpoint = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
+        if checkpoint.get("version") != CHECKPOINT_VERSION:
+            raise ValueError(
+                f"Unsupported checkpoint version '{checkpoint.get('version')}': expected '{CHECKPOINT_VERSION}'."
+            )
+        self._validate_checkpoint(checkpoint)
+        self._load_checkpoint(checkpoint)
+
+    def _get_agent_hierarchy(self) -> Generator["MultiStepAgent"]:
+        """Yield this agent, then all the agents that it directly or indirectly manages."""
+        yield self
+        for agent in self.managed_agents.values():
+            if isinstance(agent, MultiStepAgent):
+                yield from agent._get_agent_hierarchy()
+
+    def _setup_checkpointing(self, checkpoint_path: str | Path) -> None:
+        self._checkpoint_path = Path(checkpoint_path)
+        for agent in self._get_agent_hierarchy():
+            agent._checkpoint_root = self
+            agent._checkpoint = agent._get_checkpoint_state()
+
+    def _teardown_checkpointing(self) -> None:
+        self._checkpoint_path = None
+        for agent in self._get_agent_hierarchy():
+            agent._checkpoint_root = None
+
+    def _save_step_checkpoint(self, seal_managed_agents: bool = True) -> None:
+        """Record the state of the agent, to be called each time a step is completed.
+
+        Args:
+            seal_managed_agents (`bool`, default `True`): Whether the runs of the managed agents are accounted for in the
+                completed step, in which case they should not be resumed anymore.
+        """
+        if seal_managed_agents:
+            for agent in list(self._get_agent_hierarchy())[1:]:
+                agent._has_resumable_run = False
+                agent._resume_pending = False
+                if agent._checkpoint is not None:
+                    agent._checkpoint = {**agent._checkpoint, "resumable": False}
+        if self._checkpoint_root is not None:
+            self._checkpoint = self._get_checkpoint_state()
+            self._checkpoint_root._write_checkpoint(self._checkpoint_root._checkpoint_path)
+
+    def _get_checkpoint_state(self) -> dict[str, Any]:
+        """Convert the state of the agent, without its managed agents, to a JSON-serializable dictionary."""
+        state = {}
+        for name, value in self.state.items():
+            try:
+                state[name] = SafeSerializer.dumps(value)
+            except Exception:
+                if name not in self._unsaved_state_keys:
+                    self._unsaved_state_keys.add(name)
+                    self.logger.log(
+                        f"Additional argument '{name}' cannot be safely serialized: it is left out of the checkpoint.",
+                        level=LogLevel.INFO,
+                    )
+        return {
+            "class": self.__class__.__name__,
+            "name": self.name,
+            "task": self.task,
+            "resumable": self._has_resumable_run,
+            "state": state,
+            "memory": self.memory.to_dict(),
+        }
+
+    def _set_checkpoint_state(self, checkpoint_state: dict[str, Any]) -> None:
+        """Restore the state of the agent from a dictionary generated by `_get_checkpoint_state`."""
+        self.task = checkpoint_state["task"]
+        self._has_resumable_run = self._resume_pending = checkpoint_state["resumable"]
+        self.state = {name: SafeSerializer.loads(value) for name, value in checkpoint_state["state"].items()}
+        self.memory = AgentMemory.from_dict(checkpoint_state["memory"])
+        self.monitor.reset()
+        for memory_step in self.memory.steps:
+            if isinstance(memory_step, ActionStep):
+                self.monitor.step_durations.append(memory_step.timing.duration)
+                if memory_step.token_usage is not None:
+                    self.monitor.total_input_token_count += memory_step.token_usage.input_tokens
+                    self.monitor.total_output_token_count += memory_step.token_usage.output_tokens
+
+    def _write_checkpoint(self, checkpoint_path: str | Path) -> None:
+        """Write the last recorded states of the agent and of its managed agents to a checkpoint file."""
+        checkpoint_path = Path(checkpoint_path)
+        with self._checkpoint_lock:  # Managed agents may complete steps in parallel
+            checkpoint = {"version": CHECKPOINT_VERSION, **self._build_checkpoint()}
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            # Write to a temporary file first, for an interruption not to leave a corrupted checkpoint
+            temporary_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+            temporary_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+            os.replace(temporary_path, checkpoint_path)
+
+    def _build_checkpoint(self) -> dict[str, Any]:
+        return {
+            **self._checkpoint,
+            "managed_agents": {
+                name: agent._build_checkpoint()
+                for name, agent in self.managed_agents.items()
+                if isinstance(agent, MultiStepAgent)
+            },
+        }
+
+    def _validate_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Check that a checkpoint was saved by an agent with the same class and managed agents."""
+        if checkpoint["class"] != self.__class__.__name__:
+            raise ValueError(
+                f"Checkpoint of a '{checkpoint['class']}' cannot be loaded in a '{self.__class__.__name__}'."
+            )
+        managed_agents = {
+            name: agent for name, agent in self.managed_agents.items() if isinstance(agent, MultiStepAgent)
+        }
+        if set(checkpoint["managed_agents"]) != set(managed_agents):
+            raise ValueError(
+                f"Checkpoint has managed agents {sorted(checkpoint['managed_agents'])}, "
+                f"but the agent has managed agents {sorted(managed_agents)}."
+            )
+        for name, agent in managed_agents.items():
+            agent._validate_checkpoint(checkpoint["managed_agents"][name])
+
+    def _load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        self._checkpoint = {
+            key: value for key, value in checkpoint.items() if key not in ("version", "managed_agents")
+        }
+        self._set_checkpoint_state(self._checkpoint)
+        for name, managed_agent_checkpoint in checkpoint["managed_agents"].items():
+            self.managed_agents[name]._load_checkpoint(managed_agent_checkpoint)
 
     def save(self, output_dir: str | Path, relative_path: str | None = None):
         """
@@ -1762,6 +2015,17 @@ class CodeAgent(MultiStepAgent):
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
         memory_step.action_output = code_output.output
         yield ActionOutput(output=code_output.output, is_final_answer=code_output.is_final_answer)
+
+    def _get_checkpoint_state(self) -> dict[str, Any]:
+        checkpoint_state = super()._get_checkpoint_state()
+        checkpoint_state["python_executor"] = self.python_executor.dump_state()
+        return checkpoint_state
+
+    def _set_checkpoint_state(self, checkpoint_state: dict[str, Any]) -> None:
+        super()._set_checkpoint_state(checkpoint_state)
+        # Tools are sent first, for the functions restored in the executor to have access to them
+        self.python_executor.send_tools({**self.tools, **self.managed_agents})
+        self.python_executor.load_state(checkpoint_state["python_executor"])
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the agent to a dictionary representation.

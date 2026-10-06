@@ -132,3 +132,40 @@ while final_answer is None and step_number <= 10:
 
 print("The final answer is:", final_answer)
 ```
+
+### Checkpoint a run and resume it later
+
+Long runs can get interrupted: a network error, a crashed process, a machine that restarts...
+To avoid starting over, pass a `checkpoint_path` to [`~MultiStepAgent.run`]: after each completed step, the agent saves its state to this file.
+
+```py
+from smolagents import InferenceClientModel, CodeAgent
+
+agent = CodeAgent(tools=[], model=InferenceClientModel())
+agent.run("What is the 20th Fibonacci number?", checkpoint_path="checkpoint.json")
+```
+
+If the run gets interrupted, create your agent again with the same configuration, and call [`~MultiStepAgent.resume`]:
+the agent picks up after its last completed step instead of starting over.
+
+```py
+agent = CodeAgent(tools=[], model=InferenceClientModel())
+agent.resume("checkpoint.json")
+```
+
+The checkpoint is a JSON file. It contains:
+- The memory of the agent: its task and all its completed steps. A step that was interrupted halfway is not saved: it is run again when resuming.
+- For a [`CodeAgent`], the state of its Python executor: variables, imports, and functions defined in the code of the previous steps.
+- The same information for each of its managed agents. A managed agent that was interrupted in the middle of its own run also continues from its last completed step, as soon as its manager agent calls it again with the same task.
+
+Only the state of the agent is saved, not its configuration: the model, tools and managed agents are those of the agent on which you call `resume`.
+
+> [!TIP]
+> Variables are saved in a safe JSON format, which supports the most common types: builtin types, dates, numpy arrays, PIL images...
+> Variables of other types, for instance dataframes or class instances, are left out of the checkpoint with a warning, so your agent has to compute them again after resuming.
+> To save them as well, you can allow pickle with `CodeAgent(..., executor_kwargs={"allow_pickle": True})`.
+> Since unpickling can execute arbitrary code, only do this if you trust the checkpoint files that you load.
+
+Checkpoints are supported with the local Python executor only: the state of remote executors cannot be saved.
+
+You can also call [`~MultiStepAgent.save_checkpoint`] and [`~MultiStepAgent.load_checkpoint`] yourself between two runs, for instance to restore the memory of an agent and inspect it with `agent.replay()`.

@@ -100,6 +100,21 @@ class AgentError(Exception):
     def dict(self) -> dict[str, str]:
         return {"type": self.__class__.__name__, "message": str(self.message)}
 
+    @classmethod
+    def from_dict(cls, error_dict: "dict[str, str]") -> "AgentError":
+        """Recreate an error from its `dict()` representation, without logging it again."""
+
+        def get_subclasses(error_cls):
+            for subclass in error_cls.__subclasses__():
+                yield subclass
+                yield from get_subclasses(subclass)
+
+        error_cls = next((sub for sub in get_subclasses(AgentError) if sub.__name__ == error_dict["type"]), AgentError)
+        error = error_cls.__new__(error_cls)
+        Exception.__init__(error, error_dict["message"])
+        error.message = error_dict["message"]
+        return error
+
 
 class AgentParsingError(AgentError):
     """Exception raised for errors in parsing in the agent"""

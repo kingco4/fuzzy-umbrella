@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import ast
+import json
 import time
 import types
 from contextlib import nullcontext as does_not_raise
@@ -42,6 +43,7 @@ from smolagents.local_python_executor import (
     get_safe_module,
     timeout,
 )
+from smolagents.serialization import SerializationError
 
 
 # Fake function we will use as tool
@@ -2435,6 +2437,80 @@ class TestLocalPythonExecutor:
         executor.send_tools({})
         result = executor(code).output
         assert result is expected_result
+
+    def test_dump_and_load_state(self):
+        executor = LocalPythonExecutor(["numpy"])
+        executor.send_tools({})
+        executor(
+            dedent(
+                """
+                import math
+                import numpy as np
+                count = 3
+                values = {"a": (1, 2), "b": {3}}
+                array = np.arange(3)
+
+                def scale(x):
+                    return x * count * math.floor(2.5)
+                """
+            )
+        )
+        state_dict = json.loads(json.dumps(executor.dump_state()))
+        assert state_dict["skipped"] == []
+
+        new_executor = LocalPythonExecutor(["numpy"])
+        new_executor.send_tools({})
+        new_executor.send_variables({"stale": 1})
+        new_executor.load_state(state_dict)
+
+        assert "stale" not in new_executor.state
+        assert new_executor.state["values"] == {"a": (1, 2), "b": {3}}
+        assert new_executor("scale(2) + int(array.sum()) + np.ones(2).sum()").output == 12 + 3 + 2
+
+    def test_dump_state_skips_unserializable_variables(self, caplog):
+        executor = LocalPythonExecutor([])
+        executor.send_tools({})
+        executor("x = 1\nsquare = lambda v: v * v")
+        with caplog.at_level("WARNING"):
+            state_dict = executor.dump_state()
+            executor.dump_state()
+        assert state_dict["skipped"] == ["square"]
+        assert list(state_dict["variables"]) == ["x"]
+        assert caplog.text.count("cannot be serialized") == 1  # Warn only once per variable
+
+        new_executor = LocalPythonExecutor([])
+        with caplog.at_level("WARNING"):
+            new_executor.load_state(state_dict)
+        assert "['square'] could not be restored" in caplog.text
+        assert new_executor.state["x"] == 1
+
+    def test_dump_and_load_state_with_pickle(self):
+        executor = LocalPythonExecutor(["pandas"], allow_pickle=True)
+        executor.send_tools({})
+        executor("import pandas as pd\ndf = pd.DataFrame({'a': [1, 2]})")
+        with pytest.warns(FutureWarning):
+            state_dict = json.loads(json.dumps(executor.dump_state()))
+        assert state_dict["skipped"] == []
+
+        # Pickled variables are rejected unless explicitly allowed
+        with pytest.raises(SerializationError):
+            LocalPythonExecutor(["pandas"]).load_state(state_dict)
+
+        new_executor = LocalPythonExecutor(["pandas"], allow_pickle=True)
+        new_executor.send_tools({})
+        with pytest.warns(FutureWarning):
+            new_executor.load_state(state_dict)
+        assert new_executor("int(df['a'].sum())").output == 3
+
+    def test_load_state_does_not_import_unauthorized_modules(self):
+        executor = LocalPythonExecutor(["os"])
+        executor("import os")
+        state_dict = executor.dump_state()
+        assert state_dict["modules"] == {"os": "os"}
+
+        new_executor = LocalPythonExecutor([])
+        new_executor.load_state(state_dict)
+        assert "os" not in new_executor.state
 
 
 class TestLocalPythonExecutorSecurity:
